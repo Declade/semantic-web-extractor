@@ -69,10 +69,18 @@ export interface ActionParam {
 
 export type ActionType = "click" | "type" | "select" | "clear" | "press_key";
 
+/** Locator descriptor for Path B targeting — role + name to build frame.getByRole() */
+export interface LocatorDescriptor {
+  role: string;
+  name: string;
+  /** Frame index for targeting within iframes */
+  frameIndex?: number;
+}
+
 export interface ActionRequest {
   action: ActionType;
-  /** Target element — by nodeId or by role+name */
-  target: { nodeId: number } | { role: string; name: string };
+  /** Target element — by nodeId (Path A) or by role+name (Path B) */
+  target: { nodeId: number } | LocatorDescriptor;
   /** Value for type/select/press_key actions */
   value?: string;
 }
