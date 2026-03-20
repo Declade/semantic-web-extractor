@@ -22,11 +22,17 @@ export interface SemanticNode {
   name: string;
   value?: string;
   states?: NodeStates;
+  /** Backend DOM node ID — present when extracted via CDP (Path A) */
   nodeId?: number;
+  /** Frame index — present when extracted from iframe via ariaSnapshot (Path B) */
+  frameIndex?: number;
   bounds?: BoundingBox;
   children?: SemanticNode[];
   meta?: Record<string, unknown>;
 }
+
+/** Describes which extraction path produced a node, for action targeting */
+export type ExtractionPath = "cdp" | "aria-snapshot";
 
 export interface NodeStates {
   disabled?: boolean;

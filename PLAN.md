@@ -1,79 +1,80 @@
 # Implementation Plan
 
-## Phase 0: Validation Spike (Do first — ~1 session)
+## Phase 0: Validation Spike — COMPLETED (2026-03-20)
 
-### 0.1 Project Setup
-- [ ] `npm init` + TypeScript + Playwright dependency
-- [ ] tsconfig.json (strict mode, ESM)
-- [ ] Create `spike/ax-tree-quality.ts`
-
-### 0.2 Spike Script
-- [ ] Connect to Chrome via CDP (`chromium.connectOverCDP('http://localhost:9222')`)
-- [ ] Navigate to ServiceNow PDI form page (e.g., incident form)
-- [ ] Extract full AX tree via `cdpSession.send('Accessibility.getFullAXTree')`
-- [ ] Count total nodes, interactive nodes (button/textbox/link/combobox), named vs unnamed
-- [ ] Resolve 3-5 `backendDOMNodeId` values to DOM elements via `DOM.resolveNode`
-- [ ] Execute a click on a resolved element to verify the chain works
-- [ ] Repeat for: list view page, Flow Designer page
-- [ ] Write findings to `spike/RESULTS.md`
-
-### 0.3 Go/No-Go
-- If >70% of interactive elements have useful role+name → proceed to Phase 1
-- If 30-70% → proceed but plan supplementary DOM injection for gaps
-- If <30% → pivot to DOM injection as primary approach
+- [x] Project setup (TypeScript, Playwright, MCP SDK)
+- [x] Spike scripts testing AX tree on ServiceNow PDI
+- [x] Tested: Home, Workspace, Workflow Studio, Flow Editor, Classic UI forms/lists
+- [x] **Result: GO** — 100% naming ratio, all nodeIds resolve, 2-97ms extraction
+- [x] Discovered two-path extraction needed (CDP + ariaSnapshot for iframes)
+- [x] Findings documented in `spike/RESULTS.md`
 
 ---
 
 ## Phase 1: MVP (~2-3 sessions)
 
 ### 1.1 Types & Error Model
-- [ ] `src/types.ts` — SemanticModel, SemanticNode, ToolResponse, error codes
-- [ ] All types from DESIGN.md schema section
+- [x] `src/types.ts` — SemanticModel, SemanticNode, ToolResponse, error codes (done in setup)
+- [ ] Update types to include `frameIndex` on SemanticNode
+- [ ] Add `LocatorDescriptor` type for Path B targeting
 
-### 1.2 Browser Connection
-- [ ] `src/browser/connection.ts` — connect to Chrome via CDP endpoint
-- [ ] Accept endpoint URL as env var or MCP config (`SWE_CDP_ENDPOINT`)
-- [ ] Return `{ browser, page, cdpSession }` tuple
-- [ ] Handle connection failure gracefully
+### 1.2 Browser Management
+- [ ] `src/browser/connection.ts` — launch Playwright Chromium (headed mode)
+- [ ] Auto-login to ServiceNow (username/password from env vars)
+- [ ] Return `{ browser, context, page }` tuple
+- [ ] Handle connection/launch failure gracefully
 
 ### 1.3 Session Monitoring
 - [ ] `src/browser/session.ts` — detect session expiry
-- [ ] Monitor for login page patterns (URL contains `/login`, AX tree has "Log in" heading)
+- [ ] Monitor for login page patterns (URL contains `/login`)
 - [ ] Detect page crashes (`page.on('crash')`)
 - [ ] Expose `getPageStatus()`: idle | loading | dialog_open | session_expired | crashed
 
-### 1.4 AX Tree Extraction
+### 1.4 Two-Path Extraction Engine
+- [ ] `src/engine/extractor.ts` — orchestrator that picks the right path
+- [ ] Detect iframes on page via `page.frames()`
+- [ ] If iframe with content found → use Path B (ariaSnapshot)
+- [ ] Otherwise → use Path A (CDP getFullAXTree)
+
+#### Path A: CDP Extraction
 - [ ] `src/engine/ax-tree.ts` — extract AX tree via CDP
 - [ ] `cdpSession.send('Accessibility.getFullAXTree')` → parse response
-- [ ] Map CDP AX nodes to our `SemanticNode` type
-- [ ] Preserve `backendDOMNodeId` as `nodeId` on each node
-- [ ] Handle frames (if ServiceNow uses iframes)
+- [ ] Map CDP AX nodes to `SemanticNode` type with `nodeId` (backendDOMNodeId)
+- [ ] Build parent/child tree from flat node list + childIds
+
+#### Path B: ariaSnapshot Extraction
+- [ ] `src/engine/aria-snapshot.ts` — extract via Playwright ariaSnapshot
+- [ ] `frame.locator("body").ariaSnapshot()` → YAML string
+- [ ] Parse YAML into `SemanticNode` tree
+- [ ] Set `frameIndex` on each node for action targeting
+- [ ] Handle multiple frames (pick the one with most content)
 
 ### 1.5 Model Builder
-- [ ] `src/engine/model-builder.ts` — build SemanticModel from raw AX tree
-- [ ] Extract page context (url, title) from page object
-- [ ] Attach nodeCount to response
-- [ ] Attach extractedAt timestamp
+- [ ] `src/engine/model-builder.ts` — build SemanticModel from either extraction path
+- [ ] Extract page context (url, title) from page/frame
+- [ ] Attach nodeCount, extractedAt timestamp
+- [ ] Merge top-level + iframe extraction results into unified model
 
 ### 1.6 Tree Pruning
 - [ ] `src/engine/pruner.ts`
 - [ ] Scoped extraction: find subtree matching `{ role, name }` scope parameter
 - [ ] Collapse decorative nodes (role "generic"/"none" with single child)
 - [ ] Depth limit (default 15, configurable)
-- [ ] Node count warning (>200 nodes → include `warning` in response)
+- [ ] Node count warning (>200 nodes → `warning` in response)
 
-### 1.7 Action Targeting
+### 1.7 Two-Path Action Targeting
 - [ ] `src/actions/targeting.ts`
-- [ ] Primary: `DOM.resolveNode({ backendNodeId })` → RemoteObjectId → action
-- [ ] Fallback: construct `page.getByRole(role, { name })` locator
-- [ ] Cache resolved elements for reuse within same extraction cycle
-- [ ] Detect stale nodeIds and trigger re-extraction
+- [ ] Path A: `DOM.resolveNode({ backendNodeId })` → RemoteObjectId → execute via CDP
+- [ ] Path B: construct `frame.getByRole(role, { name })` locator → Playwright actions
+- [ ] `{ force: true }` option for shadow DOM click interception
+- [ ] Detect stale nodeIds → fall back to role-based locator → if fail, re-extract
 
 ### 1.8 Action Executor
 - [ ] `src/actions/executor.ts`
 - [ ] Supported actions: `click`, `type`, `select`, `clear`, `press_key`
 - [ ] Action queue mutex (one action at a time)
 - [ ] Return error if action already in progress
+- [ ] Auto re-extract after action completes (return fresh model)
 
 ### 1.9 DOM Settle Detection
 - [ ] `src/actions/wait.ts`
@@ -82,17 +83,27 @@
 - [ ] Return settled state or timeout error
 
 ### 1.10 MCP Server
-- [ ] `src/mcp/tools.ts` — tool definitions for page_extract, page_action, page_navigate, page_status
+- [ ] `src/mcp/tools.ts` — tool definitions:
+  - `page_extract` — extract semantic model (with optional scope param)
+  - `page_action` — click/type/select on a target element
+  - `page_navigate` — go to a URL
+  - `page_status` — return page state, node count, current URL
 - [ ] `src/mcp/server.ts` — register tools, wire to engine
 - [ ] `src/index.ts` — entry point, parse config, start server
 
-### 1.11 Integration Test
-- [ ] `tests/integration/servicenow-form.test.ts`
-- [ ] Connect to ServiceNow PDI (requires Chrome running with remote debugging)
-- [ ] Extract AX tree from incident form
-- [ ] Verify nodeCount, key fields present (Short description, Category, etc.)
-- [ ] Fill in a field, verify value changed
-- [ ] Extract again, verify updated value in model
+### 1.11 Integration Tests
+- [ ] `tests/integration/workspace.test.ts`
+  - Launch browser, login to ServiceNow PDI
+  - Extract SOW Home — verify tabs, buttons, widgets present
+  - Navigate to Workflow Studio — verify flow list extracted
+- [ ] `tests/integration/flow-editor.test.ts`
+  - Open a flow in Workflow Studio
+  - Extract flow editor (iframe) — verify trigger, actions, data pills present
+  - Click a button (e.g., expand action) — verify model updates
+- [ ] `tests/integration/classic-ui.test.ts`
+  - Navigate to incident form (direct URL)
+  - Extract — verify form fields present
+  - Fill a field, verify value in re-extracted model
 
 ---
 
@@ -100,7 +111,7 @@
 
 ### 1.5.1 Detection
 - [ ] `src/handlers/servicenow/index.ts` — detect ServiceNow by URL pattern
-- [ ] Detect UI context: Workspace (Polaris) vs Classic (UI16) vs Flow Designer
+- [ ] Detect UI context: Workspace vs Classic vs Workflow Studio
 
 ### 1.5.2 Form Enrichment
 - [ ] Identify reference fields, choice lists, journal fields
@@ -112,8 +123,19 @@
 
 ---
 
-## Phase 2: Flow Designer (future)
-See DESIGN.md Phase 2 section.
+## Phase 2: Flow Designer Deep Integration (future)
+
+- [ ] Tier 2 extraction (DOM snapshot for bounding boxes)
+- [ ] Drag-drop research spike (HTML5 drag API vs mouse events in Workflow Studio)
+- [ ] Drag-drop via CDP mouse events
+- [ ] Data pill connection (drag pill to input field)
+- [ ] Flow creation workflow (trigger selection, action addition)
+- [ ] Delta updates (benchmark full re-extraction first)
 
 ## Phase 3: Generalization (future)
-See DESIGN.md Phase 3 section.
+
+- [ ] Vision fallback (Tier 3 — targeted screenshots)
+- [ ] Handler plugin system (dynamic loading)
+- [ ] Salesforce handler
+- [ ] App model caching
+- [ ] Developer guide for writing handlers

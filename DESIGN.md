@@ -24,6 +24,23 @@ The browser already maintains a **semantic model** of every page — the accessi
 
 Instead of "look at pixels and guess where to click", AI receives structured data and issues precise actions.
 
+### Validated by Spike (2026-03-20)
+
+Tested against ServiceNow PDI (dev205951). The AX tree captures **100% of interactive elements with labels** across all target page types:
+
+| Page | Method | Nodes | Interactive | Named | Time |
+|------|--------|-------|------------|-------|------|
+| Workflow Studio Home | CDP `getFullAXTree` | 11,624 | 1,974 | 100% | 97ms |
+| Flow Editor (canvas) | Playwright `ariaSnapshot()` on iframe | 62 lines | ~30 | 100% | fast |
+| SOW Workspace | CDP `getFullAXTree` | 833 | 42 | 100% | 17ms |
+| Classic UI Form | CDP `getFullAXTree` | 754 | 98 | 100% | 11ms |
+
+**Key discovery**: ServiceNow uses two rendering contexts requiring a **two-path extraction strategy**:
+- **Top-level pages** (Workspace, Workflow Studio list): CDP `getFullAXTree` with `backendDOMNodeId`
+- **Iframe content** (Flow Editor canvas, Classic UI forms): Playwright `frame.ariaSnapshot()` with role-based locators
+
+See [spike/RESULTS.md](spike/RESULTS.md) for full findings.
+
 ---
 
 ## Architecture
@@ -57,10 +74,15 @@ Instead of "look at pixels and guess where to click", AI receives structured dat
                     │
 ┌───────────────────▼─────────────────────────────────┐
 │              Action Execution Layer                   │
-│  Playwright CDP session (shared, persistent)          │
-│  - Direct selector-based actions (no coordinate guess)│
-│  - Shadow DOM piercing via Playwright >>> operator     │
-│  - Drag-drop via CDP Input.dispatchDragEvent           │
+│                                                       │
+│  Path A: CDP (top-level pages)                        │
+│  - DOM.resolveNode(backendNodeId) → direct execution  │
+│                                                       │
+│  Path B: Playwright (iframe content)                  │
+│  - frame.getByRole(role, { name }) → locator actions  │
+│  - { force: true } for shadow DOM click interception  │
+│                                                       │
+│  Both: drag-drop via CDP mouse events (Phase 2)       │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -70,9 +92,20 @@ Instead of "look at pixels and guess where to click", AI receives structured dat
 
 ### Tier 1: Accessibility Tree (Primary — used for ~80% of interactions)
 
-**Source**: CDP `Accessibility.getFullAXTree` via Playwright's `page.context().newCDPSession(page)`.
+ServiceNow uses two rendering contexts that require different extraction paths:
 
-> **Note**: Playwright's `page.accessibility.snapshot()` is deprecated as of v1.50. We use CDP directly, which also gives us `backendDOMNodeId` for each AX node — solving the element targeting problem (see Action Targeting below).
+**Path A — Top-level pages** (Workspace, Workflow Studio list, any non-iframe content):
+- **Source**: CDP `Accessibility.getFullAXTree` via `page.context().newCDPSession(page)`
+- **Advantage**: Returns `backendDOMNodeId` for precise element targeting
+- **Works for**: SOW Home, Workflow Studio flow list, standalone Classic UI pages
+
+**Path B — Iframe content** (Flow Editor canvas, Classic UI via `nav_to.do`):
+- **Source**: Playwright `frame.locator("body").ariaSnapshot()` → parse YAML into SemanticNode tree
+- **Reason**: Same-origin iframes can't get separate CDP sessions in Playwright
+- **Targeting**: `frame.getByRole(role, { name })` locator chains instead of nodeId
+- **Works for**: Flow Editor (the actual canvas with triggers, actions, data pills)
+
+> **Note**: Playwright's `page.accessibility.snapshot()` is deprecated as of v1.50. We use CDP directly for top-level pages, and Playwright's non-deprecated `ariaSnapshot()` for iframe content.
 
 **What it provides**:
 - Element roles (button, textbox, link, tree, treeitem, dialog, menu, menuitem, etc.)
@@ -102,16 +135,23 @@ Instead of "look at pixels and guess where to click", AI receives structured dat
 
 ### Action Targeting (AX Node → DOM Element)
 
-The AX tree does not contain CSS selectors. We use a two-strategy approach:
+The AX tree does not contain CSS selectors. We use a two-path approach matching the extraction paths:
 
-1. **Primary: CDP `backendDOMNodeId`** — Each AX node from `getFullAXTree` includes a `backendDOMNodeId`. To act on it:
-   - `DOM.resolveNode({ backendNodeId })` → returns a `Runtime.RemoteObjectId`
-   - `Runtime.callFunctionOn({ objectId, functionDeclaration: 'function() { this.click() }' })` for direct execution
-   - Or resolve to a Playwright `ElementHandle` via `page.evaluateHandle()` for Playwright-native actions
+**Path A — CDP-extracted nodes** (top-level pages):
+1. Each AX node includes `backendDOMNodeId`
+2. `DOM.resolveNode({ backendNodeId })` → returns a `Runtime.RemoteObjectId`
+3. `Runtime.callFunctionOn({ objectId, functionDeclaration: 'function() { this.click() }' })` for direct execution
+4. Or resolve to a Playwright `ElementHandle` via `page.evaluateHandle()` for Playwright-native actions
 
-2. **Fallback: Playwright role-based locators** — Construct `page.getByRole(role, { name })` chains from the AX node's role and name. This is the same approach used by Playwright's own MCP server. Works well when role+name combinations are unique on the page.
+**Path B — ariaSnapshot-extracted nodes** (iframe content like Flow Editor):
+1. Parse YAML snapshot into SemanticNode tree
+2. Construct `frame.getByRole(role, { name })` locator from the node's role and name
+3. Execute via Playwright locator actions: `locator.click()`, `locator.fill()`, etc.
+4. Use `{ force: true }` when ServiceNow shadow DOM components intercept pointer events (validated in spike)
 
-The AI never sees selectors. Internally, the engine maps each `SemanticNode` to an action target via its `nodeId` (backendDOMNodeId). If the nodeId is stale (element was removed/recreated), we fall back to role-based locator matching.
+**Unified interface**: The AI never sees the distinction. Each `SemanticNode` has either a `nodeId` (Path A) or a `locator` descriptor (Path B). The engine resolves the correct targeting method internally.
+
+**Staleness handling**: If a nodeId is stale (element was removed/recreated), we fall back to role-based locator matching. If both fail, we re-extract and retry once.
 
 ### Tier 2: DOM Snapshot + Layout (Secondary — used for spatial context)
 
@@ -326,8 +366,11 @@ interface SemanticNode {
     busy?: boolean;
   };
 
-  /** Backend DOM node ID for action targeting (from CDP) */
+  /** Backend DOM node ID for action targeting (from CDP, Path A) */
   nodeId?: number;
+
+  /** Frame index for iframe content (Path B) */
+  frameIndex?: number;
 
   /** Visual bounds (Tier 2, optional) */
   bounds?: { x: number; y: number; width: number; height: number };
@@ -530,9 +573,10 @@ semantic-web-extractor/
 ├── src/
 │   ├── index.ts                 # MCP server entry point
 │   ├── engine/
-│   │   ├── extractor.ts         # Core extraction orchestrator
-│   │   ├── ax-tree.ts           # AX tree extraction via CDP (Tier 1)
-│   │   ├── model-builder.ts     # Build SemanticModel from AX tree
+│   │   ├── extractor.ts         # Orchestrator: detect iframe → pick Path A or B
+│   │   ├── ax-tree.ts           # Path A: CDP getFullAXTree (top-level pages)
+│   │   ├── aria-snapshot.ts     # Path B: Playwright ariaSnapshot (iframe content)
+│   │   ├── model-builder.ts     # Build SemanticModel from either path
 │   │   ├── pruner.ts            # Tree pruning and scoping
 │   │   └── dom-snapshot.ts      # DOM snapshot + layout (Phase 2)
 │   ├── actions/
@@ -578,37 +622,37 @@ semantic-web-extractor/
 
 ---
 
-## Phase 0: Validation Spike (MUST DO FIRST)
+## Phase 0: Validation Spike — COMPLETED (2026-03-20)
 
-Before writing any production code, run a spike to validate the core assumption:
+**Result: GO** — AX tree works for all target page types. See [spike/RESULTS.md](spike/RESULTS.md).
 
-1. Open a ServiceNow PDI in Playwright (connect to existing Chrome session)
-2. Extract the AX tree via CDP `Accessibility.getFullAXTree`
-3. Navigate to: a form page, a list view, and Flow Designer
-4. For each page, evaluate:
-   - How many AX nodes are returned?
-   - Do interactive elements (buttons, inputs, links) have meaningful names?
-   - Are `now-*` web component internals exposed through the flattened AX tree?
-   - Can we resolve `backendDOMNodeId` to a clickable DOM element?
-5. Document findings in `spike/RESULTS.md`
-
-**Go/no-go decision**: If the AX tree is too sparse for ServiceNow forms (< 50% of interactive elements have useful role+name), pivot to DOM injection approach instead.
+Key discovery: Two extraction paths needed (CDP for top-level, Playwright ariaSnapshot for iframes).
+Workflow Studio (Flow Designer) found at `/$flow-designer.do` → `/now/workflow-studio/home/flow`.
 
 ## Phase 1 Scope (MVP)
 
-1. **Browser connection** (connect to existing Chrome via CDP endpoint)
-2. **Core extraction engine** (Tier 1 only — AX tree via CDP)
-3. **Action targeting** (backendDOMNodeId → DOM element → click/type/select)
+1. **Browser launch** (Playwright-managed Chromium, headed mode, auto-login to ServiceNow)
+2. **Two-path extraction engine**:
+   - Path A: CDP `getFullAXTree` for top-level pages (with `backendDOMNodeId`)
+   - Path B: Playwright `frame.ariaSnapshot()` + YAML parser for iframe content
+   - Auto-detect which path to use (check for iframes, pick the content-rich frame)
+3. **Two-path action targeting**:
+   - Path A: `DOM.resolveNode(backendNodeId)` → direct execution
+   - Path B: `frame.getByRole(role, { name })` → Playwright locator actions
+   - `{ force: true }` for shadow DOM click interception
 4. **Tree pruning & scoped extraction**
 5. **Action queue** (serialize actions, wait for DOM settle)
 6. **Generic handler** (works on any website — no app-specific logic yet)
 7. **Error model** (consistent error responses)
 8. **MCP server** with `page_extract`, `page_action`, `page_navigate`, `page_status` tools
-9. **Integration test** against a ServiceNow PDI (form + list view)
+9. **Integration tests** against ServiceNow PDI:
+   - Workspace home (SOW) — top-level page extraction
+   - Workflow Studio flow list — large grid extraction + pruning
+   - Flow Editor — iframe extraction + action on flow elements
 
-**Not in Phase 1**: ServiceNow handler, Flow Designer, drag-drop, delta updates, Tier 2/3 extraction, vision fallback, browser launch mode.
+**Not in Phase 1**: ServiceNow-specific handler, drag-drop, delta updates, Tier 2/3 extraction, vision fallback.
 
-**Phase 1 exit criteria**: AI agent (Claude via MCP) can extract a ServiceNow form page, read all field values, fill in fields, and submit — using only the generic handler.
+**Phase 1 exit criteria**: AI agent (Claude via MCP) can extract a Workflow Studio page, read the flow list, open a flow, read its triggers/actions/data pills, and click buttons — all through the generic handler.
 
 ## Phase 1.5: ServiceNow Handler
 

@@ -1,19 +1,18 @@
 /**
  * Phase 0 Spike: Validate AX tree quality on ServiceNow
  *
- * Prerequisites:
- *   1. Launch Chrome with remote debugging:
- *      /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
- *   2. Log into your ServiceNow PDI manually
- *   3. Run: npm run spike
+ * Usage:
+ *   npm run spike
  *
- * This script connects to your Chrome session, extracts the AX tree,
- * and evaluates whether it's sufficient for AI-driven automation.
+ * Automatically logs into the ServiceNow PDI and tests AX tree extraction
+ * on multiple page types (home, incident form, list view, flow designer).
  */
 
 import { chromium } from "playwright";
 
-const CDP_ENDPOINT = process.env.SWE_CDP_ENDPOINT ?? "http://localhost:9222";
+const INSTANCE_URL = process.env.SWE_INSTANCE_URL ?? "https://dev205951.service-now.com";
+const SN_USERNAME = process.env.SN_USERNAME ?? "admin";
+const SN_PASSWORD = process.env.SN_PASSWORD ?? "Ym*+ZTHx18vf";
 
 interface AXNode {
   nodeId: string;
@@ -26,141 +25,226 @@ interface AXNode {
   ignored?: boolean;
 }
 
-async function main() {
-  console.log(`\n🔗 Connecting to Chrome at ${CDP_ENDPOINT}...\n`);
+async function login(page: any) {
+  console.log("Logging in...");
+  await page.goto(`${INSTANCE_URL}/login.do`, { waitUntil: "networkidle" });
 
-  const browser = await chromium.connectOverCDP(CDP_ENDPOINT);
-  const contexts = browser.contexts();
-  if (contexts.length === 0) {
-    console.error("No browser contexts found. Is Chrome running with a page open?");
-    process.exit(1);
+  // Check if already logged in (redirected away from login)
+  if (!page.url().includes("login")) {
+    console.log("Already logged in.\n");
+    return;
   }
 
-  const pages = contexts[0].pages();
-  if (pages.length === 0) {
-    console.error("No pages found. Open a ServiceNow page in Chrome first.");
-    process.exit(1);
-  }
+  await page.fill("#user_name", SN_USERNAME);
+  await page.fill("#user_password", SN_PASSWORD);
+  await page.click("#sysverb_login");
+  await page.waitForLoadState("networkidle");
+  console.log(`Logged in. Current URL: ${page.url()}\n`);
+}
 
-  // Use the first page, or find the ServiceNow tab
-  const page = pages.find(p => p.url().includes("service-now.com")) ?? pages[0];
-  console.log(`📄 Using page: ${page.url()}\n`);
+async function analyzeAxTree(page: any, label: string) {
+  console.log(`\n\n${"═".repeat(60)}`);
+  console.log(`  AX TREE ANALYSIS: ${label}`);
+  console.log(`  URL: ${page.url()}`);
+  console.log("═".repeat(60));
 
-  // Create CDP session
-  const cdpSession = await page.context().newCDPSession(page);
+  // Collect AX trees from main frame + all child frames
+  const allNodes: AXNode[] = [];
+  const frames = page.frames();
+  console.log(`  Frames found: ${frames.length}`);
 
-  // Enable required domains
-  await cdpSession.send("Accessibility.enable" as any);
-  await cdpSession.send("DOM.enable" as any);
-
-  // Extract full AX tree
-  console.log("🌳 Extracting accessibility tree...\n");
   const startTime = Date.now();
-  const result = await cdpSession.send("Accessibility.getFullAXTree" as any) as { nodes: AXNode[] };
+  for (const frame of frames) {
+    try {
+      const cdp = await page.context().newCDPSession(frame);
+      await cdp.send("Accessibility.enable" as any);
+      await cdp.send("DOM.enable" as any);
+      const result = await cdp.send("Accessibility.getFullAXTree" as any) as { nodes: AXNode[] };
+      const frameUrl = frame.url();
+      const shortUrl = frameUrl.length > 60 ? frameUrl.slice(0, 57) + "..." : frameUrl;
+      console.log(`    Frame: ${shortUrl} → ${result.nodes.length} nodes`);
+      allNodes.push(...result.nodes);
+    } catch (e: any) {
+      console.log(`    Frame error: ${e.message.slice(0, 80)}`);
+    }
+  }
   const extractionTime = Date.now() - startTime;
 
-  const nodes = result.nodes;
-
-  // Analyze the tree
+  const nodes = allNodes;
   const totalNodes = nodes.length;
-  const nonIgnored = nodes.filter(n => !n.ignored);
-  const interactive = nonIgnored.filter(n => {
+  const nonIgnored = nodes.filter((n: AXNode) => !n.ignored);
+  const interactive = nonIgnored.filter((n: AXNode) => {
     const role = n.role?.value;
     return [
       "button", "textbox", "combobox", "checkbox", "radio",
       "link", "menuitem", "tab", "treeitem", "searchbox",
       "spinbutton", "slider", "switch", "option", "listbox",
+      "menuitemcheckbox", "menuitemradio",
     ].includes(role);
   });
-  const named = interactive.filter(n => n.name?.value && n.name.value.trim().length > 0);
-  const withBackendId = interactive.filter(n => n.backendDOMNodeId !== undefined);
+  const named = interactive.filter((n: AXNode) => n.name?.value && n.name.value.trim().length > 0);
+  const withBackendId = interactive.filter((n: AXNode) => n.backendDOMNodeId !== undefined);
 
-  console.log("═══════════════════════════════════════════════");
-  console.log("  AX TREE ANALYSIS RESULTS");
-  console.log("═══════════════════════════════════════════════");
   console.log(`  Extraction time:      ${extractionTime}ms`);
   console.log(`  Total AX nodes:       ${totalNodes}`);
   console.log(`  Non-ignored nodes:    ${nonIgnored.length}`);
-  console.log(`  Interactive elements:  ${interactive.length}`);
+  console.log(`  Interactive elements: ${interactive.length}`);
   console.log(`  Named (have label):   ${named.length} (${pct(named.length, interactive.length)})`);
   console.log(`  Have backendNodeId:   ${withBackendId.length} (${pct(withBackendId.length, interactive.length)})`);
-  console.log("═══════════════════════════════════════════════\n");
 
-  // Show role distribution
+  // Role distribution
   const roleCounts = new Map<string, number>();
   for (const node of nonIgnored) {
     const role = node.role?.value ?? "unknown";
     roleCounts.set(role, (roleCounts.get(role) ?? 0) + 1);
   }
-  console.log("Role distribution (top 20):");
-  const sorted = [...roleCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20);
+  console.log("\n  Role distribution (top 15):");
+  const sorted = [...roleCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 15);
   for (const [role, count] of sorted) {
-    console.log(`  ${role.padEnd(20)} ${count}`);
+    console.log(`    ${role.padEnd(25)} ${count}`);
   }
 
-  // Show sample interactive elements
-  console.log("\n\nSample interactive elements (first 15):");
-  console.log("─".repeat(80));
-  for (const node of interactive.slice(0, 15)) {
+  // Sample interactive elements
+  console.log("\n  Sample interactive elements (first 20):");
+  console.log("  " + "─".repeat(76));
+  for (const node of interactive.slice(0, 20)) {
     const role = node.role?.value ?? "?";
     const name = node.name?.value ?? "(unnamed)";
-    const value = node.value?.value ? ` = "${node.value.value}"` : "";
+    const value = node.value?.value ? ` = "${String(node.value.value).slice(0, 30)}"` : "";
     const bid = node.backendDOMNodeId ? ` [nodeId: ${node.backendDOMNodeId}]` : " [NO nodeId]";
-    console.log(`  ${role.padEnd(12)} "${name}"${value}${bid}`);
+    console.log(`    ${role.padEnd(15)} "${name}"${value}${bid}`);
   }
 
-  // Test backendDOMNodeId resolution
-  console.log("\n\n🔍 Testing backendDOMNodeId resolution...\n");
+  // Test backendDOMNodeId resolution (using first frame's CDP session)
+  console.log("\n  Testing backendDOMNodeId resolution...");
   const testNodes = withBackendId.slice(0, 5);
   for (const node of testNodes) {
-    try {
-      const resolved = await cdpSession.send("DOM.resolveNode" as any, {
-        backendNodeId: node.backendDOMNodeId,
-      });
-      const objectId = (resolved as any).object?.objectId;
+    let resolved = false;
+    for (const frame of page.frames()) {
+      try {
+        const testCdp = await page.context().newCDPSession(frame);
+        await testCdp.send("DOM.enable" as any);
+        const result = await testCdp.send("DOM.resolveNode" as any, {
+          backendNodeId: node.backendDOMNodeId,
+        });
+        const objectId = (result as any).object?.objectId;
+        if (objectId) {
+          const role = node.role?.value ?? "?";
+          const name = node.name?.value ?? "(unnamed)";
+          console.log(`    OK ${role} "${name}"`);
+          resolved = true;
+          break;
+        }
+      } catch {
+        // Try next frame
+      }
+    }
+    if (!resolved) {
       const role = node.role?.value ?? "?";
       const name = node.name?.value ?? "(unnamed)";
-      console.log(`  ✅ ${role} "${name}" → objectId: ${objectId ? "resolved" : "FAILED"}`);
-    } catch (e: any) {
-      const role = node.role?.value ?? "?";
-      const name = node.name?.value ?? "(unnamed)";
-      console.log(`  ❌ ${role} "${name}" → Error: ${e.message}`);
+      console.log(`    FAIL ${role} "${name}"`);
     }
   }
 
-  // Go/No-Go assessment
-  const nameRatio = interactive.length > 0 ? named.length / interactive.length : 0;
-  console.log("\n\n═══════════════════════════════════════════════");
-  console.log("  GO / NO-GO ASSESSMENT");
-  console.log("═══════════════════════════════════════════════");
-  if (nameRatio >= 0.7) {
-    console.log(`  ✅ GO — ${pct(named.length, interactive.length)} of interactive elements have names`);
-    console.log("  The AX tree is sufficient as the primary extraction signal.");
-  } else if (nameRatio >= 0.3) {
-    console.log(`  ⚠️  PARTIAL — ${pct(named.length, interactive.length)} of interactive elements have names`);
-    console.log("  Proceed with AX tree but plan supplementary DOM injection for gaps.");
-  } else {
-    console.log(`  ❌ NO-GO — Only ${pct(named.length, interactive.length)} of interactive elements have names`);
-    console.log("  Pivot to DOM injection as the primary extraction approach.");
-  }
-  console.log("═══════════════════════════════════════════════\n");
-
-  // Estimate JSON model size
-  const sampleModel = nonIgnored.slice(0, 100).map(n => ({
+  // Estimated model size
+  const sampleModel = nonIgnored.slice(0, 100).map((n: AXNode) => ({
     role: n.role?.value,
     name: n.name?.value,
     nodeId: n.backendDOMNodeId,
   }));
-  const estimatedSize = JSON.stringify(sampleModel).length * (nonIgnored.length / 100);
-  console.log(`Estimated full model JSON size: ~${Math.round(estimatedSize / 1024)}KB\n`);
+  const estimatedSize = JSON.stringify(sampleModel).length * (nonIgnored.length / Math.min(100, nonIgnored.length));
+  console.log(`\n  Estimated model JSON size: ~${Math.round(estimatedSize / 1024)}KB`);
 
-  await cdpSession.detach();
+  const nameRatio = interactive.length > 0 ? named.length / interactive.length : 0;
+  return { nameRatio, interactive: interactive.length, named: named.length, extractionTime, totalNodes };
+}
+
+async function main() {
+  console.log(`\nLaunching browser and navigating to ${INSTANCE_URL}...\n`);
+
+  const browser = await chromium.launch({
+    headless: false,
+    args: ["--window-size=1400,900"],
+  });
+
+  const context = await browser.newContext({
+    viewport: { width: 1400, height: 900 },
+  });
+  const page = await context.newPage();
+
+  // Login
+  await login(page);
+
+  const results: Array<{ label: string; nameRatio: number; extractionTime: number }> = [];
+
+  // ── Test 1: Home page (post-login) ──
+  console.log("Waiting for home page to settle...");
+  await page.waitForLoadState("networkidle");
+  await page.waitForTimeout(3000);
+  const r1 = await analyzeAxTree(page, "Home Page");
+  results.push({ label: "Home Page", nameRatio: r1.nameRatio, extractionTime: r1.extractionTime });
+
+  // ── Test 2: Incident form — direct URL (no iframe wrapper) ──
+  console.log("\n\nNavigating to Incident form (direct URL)...");
+  await page.goto(`${INSTANCE_URL}/incident.do?sys_id=-1`, { waitUntil: "networkidle" });
+  await page.waitForTimeout(5000);
+  const r2 = await analyzeAxTree(page, "Incident Form (Direct)");
+  results.push({ label: "Incident Form (Direct)", nameRatio: r2.nameRatio, extractionTime: r2.extractionTime });
+
+  // ── Test 3: Incident list — direct URL ──
+  console.log("\n\nNavigating to Incident list (direct URL)...");
+  await page.goto(`${INSTANCE_URL}/incident_list.do`, { waitUntil: "networkidle" });
+  await page.waitForTimeout(5000);
+  const r3 = await analyzeAxTree(page, "Incident List (Direct)");
+  results.push({ label: "Incident List (Direct)", nameRatio: r3.nameRatio, extractionTime: r3.extractionTime });
+
+  // ── Test 4: Workspace Incident form (Polaris, no iframe) ──
+  console.log("\n\nNavigating to Workspace Incident form...");
+  await page.goto(`${INSTANCE_URL}/now/workspace/agent/record/incident`, { waitUntil: "networkidle" });
+  await page.waitForTimeout(8000);
+  const r4 = await analyzeAxTree(page, "Workspace Incident Form");
+  results.push({ label: "Workspace Form", nameRatio: r4.nameRatio, extractionTime: r4.extractionTime });
+
+  // ── Test 5: Flow Designer ──
+  console.log("\n\nNavigating to Flow Designer...");
+  await page.goto(`${INSTANCE_URL}/now/flow-designer`, { waitUntil: "networkidle" });
+  await page.waitForTimeout(8000);
+  const r5 = await analyzeAxTree(page, "Flow Designer");
+  results.push({ label: "Flow Designer", nameRatio: r5.nameRatio, extractionTime: r5.extractionTime });
+
+  // ── Final Summary ──
+  console.log(`\n\n${"═".repeat(60)}`);
+  console.log("  FINAL SUMMARY — GO / NO-GO");
+  console.log("═".repeat(60));
+
+  for (const r of results) {
+    const status = r.nameRatio >= 0.7 ? "GO" : r.nameRatio >= 0.3 ? "PARTIAL" : "NO-GO";
+    const icon = r.nameRatio >= 0.7 ? "OK" : r.nameRatio >= 0.3 ? "WARN" : "FAIL";
+    console.log(`  [${icon}] ${r.label.padEnd(20)} ${pct2(r.nameRatio)} named | ${r.extractionTime}ms`);
+  }
+
+  const avgRatio = results.reduce((sum, r) => sum + r.nameRatio, 0) / results.length;
+  console.log(`\n  Overall: ${pct2(avgRatio)} average naming ratio`);
+
+  if (avgRatio >= 0.7) {
+    console.log("  >>> GO — AX tree is sufficient as primary extraction signal.");
+  } else if (avgRatio >= 0.3) {
+    console.log("  >>> PARTIAL — Proceed with AX tree, plan supplementary DOM injection for gaps.");
+  } else {
+    console.log("  >>> NO-GO — Pivot to DOM injection as primary approach.");
+  }
+  console.log("═".repeat(60) + "\n");
+
   await browser.close();
 }
 
 function pct(a: number, b: number): string {
   if (b === 0) return "0%";
   return `${Math.round((a / b) * 100)}%`;
+}
+
+function pct2(ratio: number): string {
+  return `${Math.round(ratio * 100)}%`;
 }
 
 main().catch(e => {
